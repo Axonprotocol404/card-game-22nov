@@ -1,43 +1,97 @@
-// A working best-game-01 entry (Node 22, standard library only): the game is this directory's
-// game/ folder, plain static files a desktop browser loads offline (game/index.html and its ES
-// modules, no library and no network request), and the program hands it in. It copies game/ and
-// screenshots/ from beside this file to /output and writes /output/dossier.json, the summary the
-// judge reads, with the vendored make.fun library. A starting point, not a winner: Block Dodger, a
-// plain 2D canvas game where a paddle dodges falling blocks and catches coins, with a title screen,
-// score, lives and levels, game over and restart, flat colours and no sound. Build your own game
-// (any genre, any library you vendor under game/, or none), put your 3 or 4 PNG or JPEG screenshots
-// in screenshots/ (the first by name is the cover) and run it.
+// make.fun best-card-game-20261122-1826 entry program.
 //
-// Serve it locally with `node serve.ts`, then open http://localhost:8080.
-// Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+// A Node 22, standard-library-only program that prepares the entry's output
+// directory: it copies game/ and screenshots/ into $MAKEFUN_OUTPUT_DIR
+// (default /output) and writes dossier.json from buildDossier of
+// vendor/makefun-game.ts, using the bounty's gate caps. It prints a banner
+// log, does light validation, and exits non-zero when anything refuses.
 
-import { cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { buildDossier } from './vendor/makefun-game.ts';
+import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 
-const here = fileURLToPath(new URL('.', import.meta.url));
-const out = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+import { buildDossier, DOSSIER_SCHEMA } from './vendor/makefun-game.ts';
 
-// Hexen Duel hand-in: banner + a pre-flight sanity log before the dossier build.
-console.log('[card-game-22nov] handing in Hexen Duel (original card battler)');
-mkdirSync(out, { recursive: true });
-cpSync(join(here, 'game'), join(out, 'game'), { recursive: true });
-mkdirSync(join(out, 'screenshots'), { recursive: true });
-if (existsSync(join(here, 'screenshots'))) cpSync(join(here, 'screenshots'), join(out, 'screenshots'), { recursive: true });
+// The bounty's gate.json caps (vendor/makefun-game.ts header, best-game-01).
+const CAPS = {
+  text_max_bytes: 163840,
+  screenshots: { max: 4, max_bytes: 262144 },
+  game_max_files: 993,
+  game_max_bytes: 50331648,
+} as const;
 
-// The scorer's own caps (reference/gate.json): only text_max_bytes shapes the bytes; the others refuse an entry the
-// scorer would refuse (more than 4 screenshots or one over 256 KiB; more than 993 files in game/ or 48 MiB of game
-// files, in all, or a path under game/ over 1000 bytes: game/ counts beside /output's own 1000-entry cap, its
-// screenshots/ and dossier.json).
-writeFileSync(
-  join(out, 'dossier.json'),
-  buildDossier(out, {
-    text_max_bytes: 163840,
-    screenshots: { max: 4, max_bytes: 262144 },
-    game_max_files: 993,
-    game_max_bytes: 50331648,
-    game_path_max_bytes: 1000,
-  }),
-);
+const outputDir = resolve(process.env.MAKEFUN_OUTPUT_DIR ?? '/output');
+const root = resolve(import.meta.dirname ?? '.');
+
+function banner(label: string): void {
+  console.log(`== make.fun entry: ${label}`);
+}
+
+function listFiles(dir: string): string[] {
+  const out: string[] = [];
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    if (e.isDirectory()) out.push(...listFiles(join(dir, e.name)));
+    else if (e.isFile()) out.push(join(dir, e.name));
+  }
+  return out;
+}
+
+function lightValidation(dir: string): string[] {
+  const problems: string[] = [];
+  const gameIndex = join(dir, 'game', 'index.html');
+  if (!existsSync(gameIndex)) problems.push('missing game/index.html in output');
+  const shots = join(dir, 'screenshots');
+  if (!existsSync(shots) || !statSync(shots).isDirectory()) {
+    problems.push('missing screenshots/ directory in output');
+  } else {
+    const images = readdirSync(shots).filter((n) => /\.(png|jpe?g)$/i.test(n));
+    if (images.length < 3 || images.length > CAPS.screenshots.max) {
+      problems.push(`screenshots/ holds ${images.length} images, expected 3..${CAPS.screenshots.max}`);
+    }
+  }
+  return problems;
+}
+
+function main(): number {
+  banner('copying entry into output');
+  // A stale output dir must not leak old files into the hand-in: replace game/
+  // and screenshots/ wholesale, keeping any other content of the output dir.
+  rmSync(join(outputDir, 'game'), { recursive: true, force: true });
+  rmSync(join(outputDir, 'screenshots'), { recursive: true, force: true });
+  rmSync(join(outputDir, 'dossier.json'), { force: true });
+  mkdirSync(outputDir, { recursive: true });
+  cpSync(join(root, 'game'), join(outputDir, 'game'), { recursive: true });
+  cpSync(join(root, 'screenshots'), join(outputDir, 'screenshots'), { recursive: true });
+
+  const gameFiles = listFiles(join(outputDir, 'game'));
+  const shots = listFiles(join(outputDir, 'screenshots'));
+  console.log(`[entry] copied game/ (${gameFiles.length} files) and screenshots/ (${shots.length} files) to ${outputDir}`);
+
+  const problems = lightValidation(outputDir);
+  if (problems.length > 0) {
+    for (const p of problems) console.error(`[entry] validation: ${p}`);
+    return 1;
+  }
+
+  banner('writing dossier.json');
+  const dossier = buildDossier(outputDir, { ...CAPS });
+  const dossierPath = join(outputDir, 'dossier.json');
+  writeFileSync(dossierPath, dossier);
+  // Round-trip check: the dossier must parse as canonical JSON with the
+  // expected schema, a cover index, and at least the three screenshots.
+  const parsed = JSON.parse(new TextDecoder('utf-8').decode(dossier)) as { schema?: string; cover?: number; images?: unknown[] };
+  if (parsed.schema !== DOSSIER_SCHEMA || parsed.cover !== 0 || (parsed.images?.length ?? 0) < 3) {
+    console.error(`[entry] validation: dossier.json is not a sound ${DOSSIER_SCHEMA} document`);
+    return 1;
+  }
+  console.log(`[entry] wrote ${dossierPath} (${dossier.length} bytes, schema ${DOSSIER_SCHEMA}, ${parsed.images!.length} images)`);
+
+  banner('done');
+  return 0;
+}
+
+try {
+  process.exitCode = main();
+} catch (err) {
+  console.error(`[entry] failed: ${(err as Error).message}`);
+  process.exitCode = 1;
+}
