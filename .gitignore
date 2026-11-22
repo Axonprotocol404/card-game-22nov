@@ -2,3 +2,11 @@ out/
 .makefun/verify/
 .makefun/compress.json
 kitsrc/
+cli/
+harness/
+starter/
+RULES.txt
+competition.yaml
+kit.json
+serve.ts
+DOSSIER.md
