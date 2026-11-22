@@ -1,327 +1,368 @@
-// The duel itself, with no rendering and no input: a turn-based rules engine the renderer
-// paints and the AI plays by simulation. One turn at a time, alternating player and foe.
-//
-// The plane: each turn refills to its owner's plane max (3, +1 per two favor at turn start),
-// cards cost plane and unspent plane carries within the turn only.
-// Ward: absorbs damage before life and vanishes at the end of its own turn.
-// Favor: a counter that scales card effects; every 2 favor raises the plane cap by 1 (to 6).
-//
-// The pending-effect queue makes compound cards work: playing Echo pushes a replay of the last
-// card onto the queue; the AI resolves the same queue in simulation, so its forecast is exact.
+// engine.js — the rules of Hexen Duel: plane, ward, favor, damage and every
+// card effect. Pure logic, no DOM. A duel is plain data; playing a card
+// mutates it and appends to the log so render/ai can both read the same state.
+// Authored fresh for the best-card-game competition entry.
 
+import { CONFIG } from './config.js';
 import { CARDS } from './cards.js';
-import { startingDeck } from './random.js';
+import { shuffledDeck } from './random.js';
 
-export const EVENT_LOG = 1;
-export const EVENT_OVER = 2;
-
-const PLANE_BASE = 3;
-const PLANE_MAX_CAP = 6;
-const FAVOR_PER_PLANE = 2;
-const HAND_SIZE = 5;
-const LIFE_MAX = 30;
-const WARD_DECAY = 0.5; // half of remaining ward rounds down at the end of the turn
-
-function freshSide(name) {
+export function newSeat(rng) {
   return {
-    name,
-    life: LIFE_MAX,
-    ward: 0,
+    life: CONFIG.startLife,
     favor: 0,
-    draw: [],
+    ward: 0,
+    planeCap: CONFIG.startPlaneCap,
+    plane: CONFIG.startPlaneCap,
     hand: [],
+    deck: shuffledDeck(rng),
     discard: [],
-    playedThisTurn: [],
-    lastCardPlayed: null,
-    hexCost: 0, // cost added to this side's next card
+    hexTax: 0, // extra cost imposed on the foe's next card
   };
 }
 
-export function createDuel(random) {
+export function newDuel(seed) {
   const duel = {
-    random,
-    player: freshSide('You'),
-    foe: freshSide('The Hexen'),
+    seed,
+    rngState: seed >>> 0,
     turn: 'player',
     turnNumber: 1,
-    plane: PLANE_BASE,
-    planeMax: PLANE_BASE,
+    player: null,
+    foe: null,
+    aegisThisTurn: { player: 0, foe: 0 },
+    cardsThisTurn: { player: 0, foe: 0 },
+    lastPlayed: { player: null, foe: null },
     log: [],
-    over: false,
-    winner: null,
-    turnCount: 0,
+    outcome: null, // 'win' | 'loss' | null
   };
-  duel.player.draw = startingDeck(random);
-  duel.foe.draw = startingDeck(random);
-  for (let i = 0; i < HAND_SIZE; i += 1) {
-    drawCard(duel, 'player');
-    drawCard(duel, 'foe');
-  }
+  duel.player = newSeatFrom(duel);
+  duel.foe = newSeatFrom(duel);
   return duel;
 }
 
-function other(who) {
-  return who === 'player' ? 'foe' : 'player';
+function newSeatFrom(duel) {
+  return {
+    life: CONFIG.startLife,
+    favor: 0,
+    ward: 0,
+    planeCap: CONFIG.startPlaneCap,
+    plane: CONFIG.startPlaneCap,
+    hand: [],
+    deck: shuffledDeck(() => rngFloat(duel)),
+    discard: [],
+    hexTax: 0, // extra cost imposed on the foe's next card
+  };
 }
 
-export function drawCard(duel, who) {
-  const side = duel[who];
-  if (side.draw.length === 0) {
-    if (side.discard.length === 0) return false;
-    side.draw = side.discard;
-    side.discard = [];
-    for (let i = side.draw.length - 1; i > 0; i -= 1) {
-      const j = Math.floor(duel.random() * (i + 1));
-      [side.draw[i], side.draw[j]] = [side.draw[j], side.draw[i]];
-    }
-  }
-  if (side.hand.length >= 10) return false;
-  side.hand.push(side.draw.pop());
+// advance the duel's own rng state; deterministic, clone-safe
+export function rngFloat(duel) {
+  let a = (duel.rngState + 0x6d2b79f5) | 0;
+  duel.rngState = a;
+  let t = Math.imul(a ^ (a >>> 15), 1 | a);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+
+export function favorCap(duel, seat) {
+  const me = duel[seat];
+  const bonus = Math.floor(me.favor / CONFIG.favorPerCapPoint);
+  return Math.min(CONFIG.maxPlaneCap, CONFIG.startPlaneCap + bonus);
+}
+
+export function canPlay(duel, seat, index) {
+  const me = duel[seat];
+  const c = CARDS[me.hand[index]];
+  if (!c) return false;
+  const effective = c.cost + me.hexTax;
+  if (effective > me.plane) return false;
   return true;
 }
 
-export function planeMaxOf(duel) {
-  return Math.min(PLANE_MAX_CAP, PLANE_BASE + Math.floor(duel[duel.turn].favor / FAVOR_PER_PLANE));
+export function effectiveCost(duel, seat, id) {
+  return CARDS[id].cost + duel[seat].hexTax;
 }
 
-/** Start the next turn: refill plane, decay ward, hexes clear at the owner's turn start. */
-export function beginTurn(duel) {
-  const who = duel.turn;
-  const side = duel[who];
-  side.hexCost = 0;
-  duel.planeMax = planeMaxOf(duel);
-  duel.plane = duel.planeMax;
-  side.playedThisTurn = [];
-  duel.turnCount += 1;
-  // Ward fades at the start of the ward-owner's next turn: it protected the intervening attacks.
-  side.ward = Math.floor(side.ward * WARD_DECAY);
-  for (let i = 0; i < 1; i += 1) drawCard(duel, who);
-  pushLog(duel, `${side.name}: turn ${duel.turnCount}, plane ${duel.plane}/${duel.planeMax}`);
-}
-
-function pushLog(duel, text) {
-  duel.log.push(text);
-  if (duel.log.length > 60) duel.log.shift();
-}
-
-/** Play the card at hand index `index` for the side whose turn it is. Returns the events fired. */
-export function playCard(duel, index) {
-  const who = duel.turn;
-  const side = duel[who];
-  const id = side.hand[index];
-  if (id === undefined) return 0;
-  const card = CARDS[id];
-  const cost = cardCost(duel, id);
-  if (cost > duel.plane) return 0;
-  if (id === 'meteor' && side.playedThisTurn.some((c) => CARDS[c].suit === 'lantern')) {
-    // Meteor's own rule, checked here rather than inside resolve so the cost preview matches.
-    if (duel.plane < cost + 2) return 0;
-  }
-  side.hand.splice(index, 1);
-  side.discard.push(id);
-  side.lastCardPlayed = id;
-  side.playedThisTurn.push(id);
-  duel.plane -= cost;
-  side.hexCost = 0; // a hex taxes the next card only
-  const events = resolveCard(duel, who, id);
-  checkOver(duel);
-  return events;
-}
-
-/** The cost the side would pay right now, hexes and Meteor's rider included. */
-export function cardCost(duel, id) {
-  const card = CARDS[id];
-  const side = duel[duel.turn];
-  let cost = card.cost + side.hexCost;
-  if (id === 'meteor' && side.playedThisTurn.some((c) => CARDS[c].suit === 'lantern')) cost += 2;
-  return cost;
-}
-
-function dealDamage(duel, target, amount) {
-  const side = duel[target];
+function damage(duel, target, amount) {
+  const t = duel[target];
   let left = amount;
-  if (side.ward > 0) {
-    const absorbed = Math.min(side.ward, left);
-    side.ward -= absorbed;
-    left -= absorbed;
+  if (t.ward > 0) {
+    const soaked = Math.min(t.ward, left);
+    t.ward -= soaked;
+    left -= soaked;
   }
-  side.life -= left;
-  pushLog(duel, `${side.name} takes ${amount} damage${amount - left > 0 ? ` (${amount - left} warded)` : ''}`);
+  t.life -= left;
 }
 
-function heal(duel, who, amount) {
-  const side = duel[who];
-  const before = side.life;
-  side.life = Math.min(LIFE_MAX, side.life + amount);
-  if (side.life > before) pushLog(duel, `${side.name} heals ${side.life - before} life`);
+function heal(duel, seat, amount) {
+  duel[seat].life = Math.min(CONFIG.startLife, duel[seat].life + amount);
 }
 
-/** Resolve one card's whole effect, including the compound ones. Returns EVENT_* flags. */
-export function resolveCard(duel, who, id) {
-  const side = duel[who];
-  const foe = duel[other(who)];
-  const foeWho = other(who);
-  const card = CARDS[id];
-  const suit = card.suit;
-  let events = EVENT_LOG;
-  const aegisCount = side.playedThisTurn.filter((c) => CARDS[c].suit === 'aegis').length;
+function gainFavor(duel, seat, amount) {
+  const me = duel[seat];
+  me.favor = Math.min(CONFIG.maxFavor, me.favor + amount);
+  me.planeCap = favorCap(duel, seat);
+}
+
+function draw(duel, seat, n) {
+  const me = duel[seat];
+  for (let i = 0; i < n; i++) {
+    if (me.hand.length >= CONFIG.maxHandSize) return;
+    if (me.deck.length === 0) {
+      if (me.discard.length === 0) return;
+      me.deck = me.discard;
+      me.discard = [];
+      // reshuffle roughly with the duel rng (deterministic per seed)
+      const deck = me.deck;
+      for (let k = deck.length - 1; k > 0; k--) {
+        const j = Math.floor(rngFloat(duel) * (k + 1));
+        [deck[k], deck[j]] = [deck[j], deck[k]];
+      }
+    }
+    me.hand.push(me.deck.pop());
+  }
+}
+
+function foeOf(seat) {
+  return seat === 'player' ? 'foe' : 'player';
+}
+
+// The heart: apply one card's effect. Returns the resolved card id.
+export function playCard(duel, seat, index, opts) {
+  const me = duel[seat];
+  const id = me.hand[index];
+  const c = CARDS[id];
+  if (!c || !canPlay(duel, seat, index)) return null;
+  const foe = foeOf(seat);
+  const cost = c.cost + me.hexTax;
+  me.plane -= cost;
+  me.hexTax = 0;
+  me.hand.splice(index, 1);
+  duel.cardsThisTurn[seat] += 1;
+  duel.lastPlayed[seat] = id;
+
+  const halfFavor = Math.floor(me.favor / 2);
 
   switch (id) {
     case 'slash':
-      dealDamage(duel, foeWho, 4 + Math.floor(side.favor / 8));
+      damage(duel, foe, 2 + halfFavor);
       break;
     case 'crosscut': {
-      let dmg = 3;
-      const before = side.playedThisTurn.length;
-      dealDamage(duel, foeWho, dmg);
-      if (before >= 2 && CARDS[side.playedThisTurn[before - 2]].suit === 'aegis') {
-        dealDamage(duel, foeWho, 3);
-        pushLog(duel, 'Crosscut chains for 3 more!');
-      }
+      const bonus = duel.aegisThisTurn[seat] > 0 ? 2 : 0;
+      damage(duel, foe, 3 + bonus);
       break;
     }
+    case 'duelist_pride':
+      damage(duel, foe, 3 * Math.max(1, duel.aegisThisTurn[seat]));
+      break;
+    case 'blood_pact':
+      me.life -= 3;
+      damage(duel, foe, 7);
+      break;
     case 'meteor':
-      dealDamage(duel, foeWho, 9 + Math.floor(side.favor / 6));
-      break;
-    case 'bloodpact':
-      side.life -= 3;
-      dealDamage(duel, foeWho, 7);
-      pushLog(duel, `${side.name} pays 3 life to the pact`);
-      break;
-    case 'duel':
-      dealDamage(duel, foeWho, 3 + 3 * aegisCount);
-      pushLog(duel, `Duelist\u2019s Pride: ${aegisCount} Aegis played, ${3 + 3 * aegisCount} damage`);
+      damage(duel, foe, 9);
       break;
     case 'scribe':
-      drawCard(duel, who); drawCard(duel, who);
-      pushLog(duel, `${side.name} draws 2`);
+      draw(duel, seat, 2);
       break;
     case 'tailwind':
-      duel.plane += 2;
-      drawCard(duel, who);
-      pushLog(duel, `${side.name} rides the wind: +2 plane`);
+      me.plane += 2;
+      draw(duel, seat, 1);
       break;
-    case 'moonletter': {
-      drawCard(duel, who);
-      if (side.hand.length === 0) { drawCard(duel, who); drawCard(duel, who); pushLog(duel, 'The Moon Letter returns twice!'); }
+    case 'moon_letter':
+      if (me.hand.length === 0) draw(duel, seat, 5);
+      else draw(duel, seat, 1);
       break;
-    }
-    case 'carousel': {
-      const n = Math.max(1, Math.floor(side.draw.length / 5));
-      for (let i = 0; i < n; i += 1) drawCard(duel, who);
-      pushLog(duel, `Carousel turns: ${n} card${n === 1 ? '' : 's'}`);
+    case 'carousel':
+      draw(duel, seat, Math.max(1, Math.ceil(me.deck.length / 6)));
       break;
-    }
     case 'echo': {
-      const last = side.playedThisTurn.filter((c) => c !== 'echo' && CARDS[c].suit !== 'mask').pop();
-      if (last) {
-        pushLog(duel, `Echo replays ${CARDS[last].name}`);
-        events |= resolveCard(duel, who, last);
-      } else {
-        dealDamage(duel, foeWho, 2);
-        pushLog(duel, 'Echo has nothing to repeat: 2 damage');
-      }
+      // replay the previous non-echo card of this turn for free
+      const prior = duel.cardsThisTurn[seat] > 1 ? findPrior(duel, seat) : null;
+      if (prior) applyEffect(duel, seat, prior);
       break;
     }
-    case 'coin':
-      side.favor += 3;
-      pushLog(duel, `${side.name} gains 3 favor`);
+    case 'swiftriver':
+      damage(duel, foe, 2);
+      draw(duel, seat, 2);
+      duel[foe].plane = Math.max(0, duel[foe].plane - 1);
       break;
-    case 'silk': {
-      const gain = 2 * side.playedThisTurn.length - 2; // cards played before this one
-      side.favor += Math.max(0, gain) + 1;
-      pushLog(duel, `Silk Banner: +${Math.max(0, gain) + 1} favor`);
+    case 'gilded_coin':
+      gainFavor(duel, seat, 2);
       break;
-    }
-    case 'favor':
-      side.favor += 6;
-      heal(duel, who, 2);
+    case 'silk_banner':
+      gainFavor(duel, seat, duel.cardsThisTurn[seat]);
       break;
-    case 'midas': {
-      const gain = duel.plane;
-      side.favor += gain;
-      duel.plane = duel.planeMax;
-      pushLog(duel, `Midas Ledger: +${gain} favor, plane refilled`);
+    case 'courtly_favor':
+      gainFavor(duel, seat, 3);
+      heal(duel, seat, 2);
       break;
-    }
-    case 'ward':
-      side.ward += 5 + side.favor;
-      pushLog(duel, `${side.name} raises ${5 + side.favor} ward`);
+    case 'midas_ledger':
+      gainFavor(duel, seat, me.plane);
+      me.plane = me.planeCap;
       break;
-    case 'bulwark':
-      side.ward += 8;
-      heal(duel, who, 2);
+    case 'pearl_dowry':
+      gainFavor(duel, seat, 4);
+      me.ward += 2;
       break;
-    case 'emberveil': {
-      side.ward += 3;
-      const burst = Math.floor(side.ward / 5) * 2;
-      if (burst > 0) dealDamage(duel, foeWho, burst);
-      pushLog(duel, `Ember Veil: ${burst} burning damage`);
+    case 'ward_charm':
+      me.ward += 2 + halfFavor;
+      break;
+    case 'ember_veil': {
+      const hit = me.ward;
+      if (hit > 0) damage(duel, foe, hit);
+      me.ward = Math.floor(me.ward / 2);
       break;
     }
-    case 'hearth':
-      heal(duel, who, 6);
-      side.favor += 1;
+    case 'hearthfire':
+      heal(duel, seat, 6);
+      break;
+    case 'everflame':
+      me.ward += 4;
+      if (me.favor >= 8) damage(duel, foe, 3);
+      break;
+    case 'hex':
+      duel[foe].hexTax += 2;
       break;
     case 'pickpocket': {
-      const stolen = Math.min(3, foe.favor);
-      foe.favor -= stolen;
-      side.favor += stolen;
-      if (foe.hand.length > 0) {
-        const i = Math.floor(duel.random() * foe.hand.length);
-        const [stolenCard] = foe.hand.splice(i, 1);
-        foe.discard.push(stolenCard);
-        pushLog(duel, `Pickpocket: ${stolen} favor, ${CARDS[stolenCard].name} discarded`);
+      const stolen = Math.min(2, duel[foe].favor);
+      duel[foe].favor -= stolen;
+      gainFavor(duel, seat, stolen);
+      if (duel[foe].hand.length > 0) {
+        const j = Math.floor(rngFloat(duel) * duel[foe].hand.length);
+        duel[foe].discard.push(duel[foe].hand.splice(j, 1)[0]);
       }
       break;
     }
     case 'jettison': {
-      // The chooser picks from the UI; the engine discards the cheapest (or all, via chooseDiscard).
-      const count = Math.min(3, side.hand.length);
-      for (let i = 0; i < count; i += 1) {
-        const c = side.hand.pop();
-        side.discard.push(c);
-        drawCard(duel, who);
-      }
-      drawCard(duel, who);
-      pushLog(duel, `Jettison: ${count} cards traded for ${count + 1}`);
+      const n = me.hand.length;
+      me.discard.push(...me.hand.splice(0));
+      draw(duel, seat, Math.max(0, n - 1));
       break;
     }
-    case 'hex':
-      foe.hexCost += 2;
-      pushLog(duel, `${foe.name}\u2019s next card costs 2 more`);
-      break;
-    case 'mirror': {
-      const last = side.playedThisTurn.filter((c) => c !== 'mirror').pop();
-      if (last) {
-        pushLog(duel, `Mask of Mirrors copies ${CARDS[last].name}`);
-        events |= resolveCard(duel, who, last);
-      } else {
-        pushLog(duel, 'The mask reflects nothing');
-      }
+    case 'mask_of_mirrors': {
+      const mirror = duel.lastPlayed[foe];
+      if (mirror && CARDS[mirror]) applyEffect(duel, seat, mirror);
       break;
     }
     default:
       break;
   }
-  return events;
+
+  if (c.suit === 'aegis') duel.aegisThisTurn[seat] += 1;
+
+  duel.log.push({
+    seat,
+    id,
+    text: seat === 'player' ? `You played ${c.name}` : `Hexen played ${c.name}`,
+  });
+  if (duel.log.length > 8) duel.log.shift();
+
+  duel[seat].discard.push(id);
+  checkOutcome(duel);
+  return id;
 }
 
-function checkOver(duel) {
-  if (duel.over) return;
-  if (duel.player.life <= 0 || duel.foe.life <= 0) {
-    duel.over = true;
-    // Both dead the same resolution: the attacker (whose turn it is) takes it.
-    if (duel.foe.life <= 0 && duel.player.life > 0) duel.winner = 'player';
-    else if (duel.player.life <= 0 && duel.foe.life > 0) duel.winner = 'foe';
-    else duel.winner = duel.turn;
+function findPrior(duel, seat) {
+  // last card the seat played this turn, ignoring echo itself
+  for (let i = duel.log.length - 1; i >= 0; i--) {
+    const e = duel.log[i];
+    if (e.seat === seat && e.id !== 'echo') return e.id;
+  }
+  return null;
+}
+
+// apply an effect without paying or discarding (echo / mirror copies)
+function applyEffect(duel, seat, id) {
+  const foe = foeOf(seat);
+  const me = duel[seat];
+  const halfFavor = Math.floor(me.favor / 2);
+  switch (id) {
+    case 'slash': damage(duel, foe, 2 + halfFavor); break;
+    case 'crosscut': damage(duel, foe, 3 + (duel.aegisThisTurn[seat] > 0 ? 2 : 0)); break;
+    case 'duelist_pride': damage(duel, foe, 3 * Math.max(1, duel.aegisThisTurn[seat])); break;
+    case 'blood_pact': me.life -= 3; damage(duel, foe, 7); break;
+    case 'meteor': damage(duel, foe, 9); break;
+    case 'scribe': draw(duel, seat, 2); break;
+    case 'tailwind': me.plane += 2; draw(duel, seat, 1); break;
+    case 'moon_letter': draw(duel, seat, me.hand.length === 0 ? 5 : 1); break;
+    case 'carousel': draw(duel, seat, Math.max(1, Math.ceil(me.deck.length / 6))); break;
+    case 'swiftriver': damage(duel, foe, 2); draw(duel, seat, 2); duel[foe].plane = Math.max(0, duel[foe].plane - 1); break;
+    case 'gilded_coin': gainFavor(duel, seat, 2); break;
+    case 'silk_banner': gainFavor(duel, seat, duel.cardsThisTurn[seat]); break;
+    case 'courtly_favor': gainFavor(duel, seat, 3); heal(duel, seat, 2); break;
+    case 'midas_ledger': gainFavor(duel, seat, me.plane); me.plane = me.planeCap; break;
+    case 'pearl_dowry': gainFavor(duel, seat, 4); me.ward += 2; break;
+    case 'ward_charm': me.ward += 2 + halfFavor; break;
+    case 'ember_veil': if (me.ward > 0) damage(duel, foe, me.ward); me.ward = Math.floor(me.ward / 2); break;
+    case 'hearthfire': heal(duel, seat, 6); break;
+    case 'everflame': me.ward += 4; if (me.favor >= 8) damage(duel, foe, 3); break;
+    case 'hex': duel[foe].hexTax += 2; break;
+    case 'pickpocket': {
+      const stolen = Math.min(2, duel[foe].favor);
+      duel[foe].favor -= stolen;
+      gainFavor(duel, seat, stolen);
+      break;
+    }
+    case 'jettison': {
+      const n = me.hand.length;
+      me.discard.push(...me.hand.splice(0));
+      draw(duel, seat, Math.max(0, n - 1));
+      break;
+    }
+    case 'echo': break;
+    case 'mask_of_mirrors': {
+      const mirror = duel.lastPlayed[foe];
+      if (mirror && CARDS[mirror]) applyEffect(duel, seat, mirror);
+      break;
+    }
+    default: break;
   }
 }
 
-/** End the current side's turn: ward decays, then the other side begins. */
 export function endTurn(duel) {
-  const who = duel.turn;
-  duel[who].ward = Math.floor(duel[who].ward * WARD_DECAY);
-  duel.turn = other(who);
-  beginTurn(duel);
+  const seat = duel.turn;
+  const me = duel[seat];
+  me.ward = Math.floor(me.ward / CONFIG.wardDecayDivisor);
+  duel.aegisThisTurn[seat] = 0;
+  duel.cardsThisTurn[seat] = 0;
+  duel.lastPlayed[seat] = null;
+  const foe = foeOf(seat);
+  const next = duel[foe];
+  next.planeCap = favorCap(duel, foe);
+  next.plane = next.planeCap;
+  draw(duel, foe, 1);
+  duel.turn = foe;
+  if (foe === 'player') duel.turnNumber += 1;
+  checkOutcome(duel);
+}
+
+export function setupHands(duel) {
+  draw(duel, 'player', CONFIG.startHand);
+  draw(duel, 'foe', CONFIG.startHand);
+}
+
+function checkOutcome(duel) {
+  const p = duel.player.life;
+  const f = duel.foe.life;
+  if (p <= 0 && f <= 0) duel.outcome = 'loss';
+  else if (f <= 0) duel.outcome = 'win';
+  else if (p <= 0) duel.outcome = 'loss';
+}
+
+// value snapshot used by the AI's simulation scoring
+export function evaluate(duel, seat) {
+  const me = duel[seat];
+  const foe = duel[foeOf(seat)];
+  return (
+    me.life * 1.0 +
+    me.ward * 0.6 +
+    me.favor * 0.8 +
+    me.plane * 0.3 +
+    me.hand.length * 0.7 +
+    me.deck.length * 0.05 -
+    foe.life * 1.1 -
+    foe.ward * 0.6 -
+    foe.favor * 0.6 -
+    foe.hand.length * 0.3
+  );
 }
