@@ -20,6 +20,8 @@ import { buildDossier } from './vendor/makefun-game.ts';
 const here = fileURLToPath(new URL('.', import.meta.url));
 const out = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
+// Hexen Duel hand-in: banner + a pre-flight sanity log before the dossier build.
+console.log('[card-game-22nov] handing in Hexen Duel (original card battler)');
 mkdirSync(out, { recursive: true });
 cpSync(join(here, 'game'), join(out, 'game'), { recursive: true });
 mkdirSync(join(out, 'screenshots'), { recursive: true });

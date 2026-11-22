@@ -1,0 +1,4 @@
+out/
+.makefun/verify/
+.makefun/compress.json
+kitsrc/
